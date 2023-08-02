@@ -1000,9 +1000,9 @@ def validate_cargs(cargs):
             print("[*] Must set --src-file in --line-search mode")
             return False
 
-    if cargs.live and not cargs.ignore_core_pattern:
-        if not check_core_pattern():
-            return False
+    # if cargs.live and not cargs.ignore_core_pattern:
+    #     if not check_core_pattern():
+    #         return False
 
     if not cargs.live and not is_dir(cargs.afl_fuzzing_dir):
         print("[*] It doesn't look like directory '%s' exists"
