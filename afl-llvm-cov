@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-#  File: afl-cov
+#  File: afl-llvm-cov
 #
 #  Version: 0.7.0
 #
@@ -62,16 +62,16 @@ def main():
     exit_failure = 1
 
     cargs = parse_cmdline()
-
+    
     if cargs.coverage_cmd:
         cargs.coverage_cmd = cargs.coverage_cmd.replace("@@", "AFL_FILE")
 
     if cargs.version:
-        print("afl-cov-" + __version__)
+        print("afl-llvm-cov-" + __version__)
         return exit_success
 
-    if cargs.gcov_check or cargs.gcov_check_bin:
-        if is_gcov_enabled(cargs):
+    if cargs.llvm_cov_check_bin:
+        if is_cov_enabled(cargs):
             return exit_success
         else:
             return exit_failure
@@ -87,9 +87,6 @@ def main():
 
     if cargs.validate_args:
         return exit_success
-
-    if cargs.func_search or cargs.line_search:
-        return not search_cov(cargs)
 
     if cargs.background:
         run_in_background()
@@ -204,17 +201,17 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
                     cargs,
                 )
 
-                cov_paths["diff"] = "%s/%s" % (
-                    cov_paths["diff_dir"],
-                    os.path.basename(f),
-                )
                 id_range_update(f, cov_paths)
+                
+                cov_replace = cargs.coverage_cmd.replace("AFL_FILE", f)
+                llvm_profile_dir = os.path.realpath(cov_paths["profdata_dir"])
+                cov_cmd = f"LLVM_PROFILE_FILE=\"{llvm_profile_dir}/{os.path.basename(f)}.profraw\" {cov_replace}"
 
                 # execute the command to generate code coverage stats
                 # for the current AFL test case file
                 if run_once:
                     run_cmd(
-                        cargs.coverage_cmd.replace("AFL_FILE", f),
+                        cov_cmd,
                         cov_paths["log_file"],
                         cargs,
                         NO_OUTPUT,
@@ -224,7 +221,7 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
                     )
                 else:
                     out_lines = run_cmd(
-                        cargs.coverage_cmd.replace("AFL_FILE", f),
+                        cov_cmd,
                         cov_paths["log_file"],
                         cargs,
                         WANT_OUTPUT,
@@ -248,21 +245,10 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
                     if cargs.cover_corpus and last_dir:
                         do_coverage = True
 
-                if do_coverage and not cargs.coverage_at_exit:
-
-                    # generate the code coverage stats for this test case
-                    lcov_gen_coverage(cov_paths, cargs)
-
-                    # diff to the previous code coverage, look for new
-                    # lines/functions, and write out results
-                    coverage_diff(curr_cycle, cov_paths, f, cov, cargs)
-
+                if do_coverage:
                     if cargs.cover_corpus:
                         # reset the range values
                         cov_paths["id_min"] = cov_paths["id_max"] = -1
-
-                    if cargs.lcov_web_all:
-                        gen_web_cov_report(cov_paths, cargs)
 
                     # log the output of the very first coverage command to
                     # assist in troubleshooting
@@ -299,7 +285,7 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
                     try:
                         time.sleep(cargs.sleep)
                     except KeyboardInterrupt:
-                        log(
+                        logr(
                             b"[!] Stopping live collection due to user interrupt",
                             cov_paths["log_file"],
                             cargs,
@@ -324,22 +310,11 @@ def process_afl_test_cases(cargs: argparse.Namespace) -> bool:
             cargs,
         )
 
-        if cargs.coverage_at_exit:
-            # generate the code coverage stats for this test case
-            lcov_gen_coverage(cov_paths, cargs)
-
-            # diff to the previous code coverage, look for new
-            # lines/functions, and write out results
-            coverage_diff(curr_cycle, cov_paths, cov_paths["id_file"], cov, cargs)
+        llvm_cov_gen_coverage(cov_paths, cargs)
 
         # write out the final zero coverage and positive coverage reports
-        write_zero_cov(cov[b"zero"], cov_paths, cargs)
-        write_pos_cov(cov[b"pos"], cov_paths, cargs)
-
-        if not cargs.disable_lcov_web:
-            lcov_gen_coverage(cov_paths, cargs)
-            gen_web_cov_report(cov_paths, cargs)
-
+        # write_zero_cov(cov[b"zero"], cov_paths, cargs)
+        # write_pos_cov(cov[b"pos"], cov_paths, cargs)
     else:
         if rv:
             logr(
@@ -364,112 +339,6 @@ def id_range_update(afl_file: str, cov_paths: CovPathsDictType) -> None:
         cov_paths["id_max"] = id_val
     elif id_val > cov_paths["id_max"]:
         cov_paths["id_max"] = id_val
-
-
-def coverage_diff(
-    cycle_num: int,
-    cov_paths: CovPathsDictType,
-    afl_file: str,
-    cov: CovDictType,
-    cargs: argparse.Namespace,
-) -> None:
-    log_lines = []  # type: List[bytes]
-    delta_log_lines = []  # type: List[bytes]
-    print_diff_header = True
-
-    # defaults
-    a_file = b"(init)"  # type: bytes
-    if cov_paths["id_file"]:
-        a_file = cov_paths["id_file"].encode()
-    delta_file = b_file = os.path.basename(afl_file).encode()  # type: bytes
-
-    if cargs.cover_corpus or cargs.coverage_at_exit:
-        a_file = b"id:%d..." % cov_paths["id_min"]
-        b_file = b"id:%d..." % cov_paths["id_max"]
-        delta_file = b"id:[%d-%d]..." % (cov_paths["id_min"], cov_paths["id_max"])
-
-    new_cov = extract_coverage(
-        cov_paths["lcov_info_final"], cov_paths["log_file"], cargs
-    )  # type: CovDictType
-
-    if not new_cov:
-        return
-
-    # We aren't interested in the number of times AFL has executed
-    # a line or function (since we can't really get this anyway because
-    # gcov stats aren't influenced by AFL directly) - what we want is
-    # simply whether a new line or function has been executed at all by
-    # this test case. So, we look for new positive coverage.
-    for f in new_cov[b"pos"]:
-        print_filename = True
-        if f not in cov[b"zero"] and f not in cov[b"pos"]:  # completely new file
-            cov_init(f, cov)
-            if print_diff_header:
-                log_lines.append(b"diff %s -> %s" % (a_file, b_file))
-                print_diff_header = False
-            for ctype in new_cov[b"pos"][f]:
-                for val in sorted(new_cov[b"pos"][f][ctype]):
-                    cov[b"pos"][f][ctype][val] = b""
-                    if print_filename:
-                        log_lines.append(b"New src file: " + f)
-                        print_filename = False
-                    log_lines.append(b"  New '" + ctype + b"' coverage: " + val)
-                    if ctype == b"line":
-                        if cargs.coverage_include_lines:
-                            delta_log_lines.append(
-                                b"%s, %d, %s, %s, %s\n"
-                                % (delta_file, cycle_num, f, ctype, val)
-                            )
-                    else:
-                        delta_log_lines.append(
-                            b"%s, %d, %s, %s, %s\n"
-                            % (delta_file, cycle_num, f, ctype, val)
-                        )
-        elif f in cov[b"zero"] and f in cov[b"pos"]:
-            for ctype in new_cov[b"pos"][f]:
-                for val in sorted(new_cov[b"pos"][f][ctype]):
-                    if val not in cov[b"pos"][f][ctype]:
-                        cov[b"pos"][f][ctype][val] = b""
-                        if print_diff_header:
-                            log_lines.append(b"diff %s -> %s" % (a_file, b_file))
-                            print_diff_header = False
-                        if print_filename:
-                            log_lines.append(b"Src file: " + f)
-                            print_filename = False
-                        log_lines.append(b"  New '" + ctype + b"' coverage: " + val)
-                        if ctype == b"line":
-                            if cargs.coverage_include_lines:
-                                delta_log_lines.append(
-                                    b"%s, %d, %s, %s, %s\n"
-                                    % (delta_file, cycle_num, f, ctype, val)
-                                )
-                        else:
-                            delta_log_lines.append(
-                                b"%s, %d, %s, %s, %s\n"
-                                % (delta_file, cycle_num, f, ctype, val)
-                            )
-
-    # now that new positive coverage has been added, reset zero
-    # coverage to the current new zero coverage
-    cov[b"zero"] = {}
-    cov[b"zero"] = new_cov[b"zero"].copy()
-
-    if len(log_lines):
-        logr(
-            b"\n    Coverage diff %s %s" % (a_file, b_file),
-            cov_paths["log_file"],
-            cargs,
-        )
-        for line in log_lines:
-            logr(line, cov_paths["log_file"], cargs)
-            append_file(line, cov_paths["diff"])
-        logr(b"", cov_paths["log_file"], cargs)
-
-    if len(delta_log_lines):
-        cfile = open(cov_paths["id_delta_cov"], "ab")
-        for line in delta_log_lines:
-            cfile.write(line)
-        cfile.close()
 
 
 def write_zero_cov(
@@ -535,134 +404,6 @@ def append_file(pstr: bytes, path: str) -> None:
     f.write(b"%s\n" % pstr)
     f.close()
 
-
-def cov_init(cfile: bytes, cov: CovDictType) -> None:
-    for k in [b"zero", b"pos"]:
-        if k not in cov:
-            cov[k] = {}
-        if cfile not in cov[k]:
-            cov[k][cfile] = {}
-            cov[k][cfile][b"function"] = {}
-            cov[k][cfile][b"line"] = {}
-
-
-def extract_coverage(
-    lcov_file: str, log_file: str, cargs: argparse.Namespace
-) -> CovDictType:
-    tmp_cov = {}  # type: CovDictType
-
-    if not os.path.exists(lcov_file):
-        logr(
-            b"[-] Coverage file '%s' does not exist, skipping." % lcov_file.encode(),
-            log_file,
-            cargs,
-        )
-        return tmp_cov
-
-    # populate old lcov output for functions/lines that were called
-    # zero times
-    with open(lcov_file, "rb") as f:
-        current_file = b""  # type: bytes
-        for line in f:
-            line = line.strip()
-
-            m = re.search(rb"SF:(\S+)", line)
-            if m and m.group(1):
-                current_file = m.group(1)
-                cov_init(current_file, tmp_cov)
-                continue
-
-            if current_file:
-                m = re.search(rb"^FNDA:(\d+),(\S+)", line)
-                if m and m.group(2):
-                    fcn = m.group(2) + b"()"
-                    if m.group(1) == b"0":
-                        # the function was never called
-                        tmp_cov[b"zero"][current_file][b"function"][fcn] = b""
-                    else:
-                        tmp_cov[b"pos"][current_file][b"function"][fcn] = b""
-                    continue
-
-                # look for lines that were never called
-                m = re.search(rb"^DA:(\d+),(\d+)", line)
-                if m and m.group(1):
-                    lnum = m.group(1)
-                    if m.group(2) == b"0":
-                        # the line was never executed
-                        tmp_cov[b"zero"][current_file][b"line"][lnum] = b""
-                    else:
-                        tmp_cov[b"pos"][current_file][b"line"][lnum] = b""
-
-    return tmp_cov
-
-
-def search_cov(cargs: argparse.Namespace) -> bool:
-    search_rv = False
-
-    id_delta_file = cargs.afl_fuzzing_dir + "/cov/id-delta-cov"
-    log_file = cargs.afl_fuzzing_dir + "/cov/afl-cov.log"
-
-    with open(id_delta_file, "rb") as f:
-        for line in f:
-            line = line.strip()
-            # id:NNNNNN*_file, cycle, src_file, cov_type, fcn/line\n")
-            [id_file, cycle_num, src_file, cov_type, val] = line.split(b", ")
-
-            if (
-                cargs.func_search
-                and cov_type == b"function"
-                and val == cargs.func_search
-            ):
-                if cargs.src_file:
-                    if cargs.src_file.encode() == src_file:
-                        logr(
-                            b"[+] Function '%s' in file: '%s' executed by: '%s', cycle: %s"
-                            % (val, src_file, id_file, cycle_num),
-                            log_file,
-                            cargs,
-                        )
-                        search_rv = True
-                else:
-                    logr(
-                        b"[+] Function '%s' executed by: '%s', cycle: %s"
-                        % (val, id_file, cycle_num),
-                        log_file,
-                        cargs,
-                    )
-                    search_rv = True
-
-            if (
-                cargs.src_file
-                and cargs.src_file.encode() == src_file
-                and cargs.line_search
-                and val == cargs.line_search.encode()
-            ):
-                if cargs.src_file.encode() == src_file:
-                    logr(
-                        b"[+] Line '%s' in file: '%s' executed by: '%s', cycle: %s"
-                        % (val, src_file, id_file, cycle_num),
-                        log_file,
-                        cargs,
-                    )
-                    search_rv = True
-
-    if not search_rv:
-        if cargs.func_search:
-            logr(
-                b"[-] Function '%s' not found..." % cargs.func_search.encode(),
-                log_file,
-                cargs,
-            )
-        elif cargs.line_search:
-            logr(
-                b"[-] Line %s not found..." % cargs.line_search.encode(),
-                log_file,
-                cargs,
-            )
-
-    return search_rv
-
-
 def get_cycle_num(id_num: int, cargs: argparse.Namespace) -> int:
     # default cycle
     cycle_num = 0
@@ -682,135 +423,39 @@ def get_cycle_num(id_num: int, cargs: argparse.Namespace) -> int:
 
     return cycle_num
 
-
-def lcov_gen_coverage(cov_paths: CovPathsDictType, cargs: argparse.Namespace):
-
-    lcov_opts = ""
+def llvm_cov_gen_coverage(cov_paths: CovPathsDictType, cargs: argparse.Namespace):
+    llvm_profdata_merge_opts = "llvm-profdata merge"
+    
+    profdata_files = sorted(glob.glob(cov_paths["profdata_dir"] + "/*.profraw"))
+    for f in profdata_files:
+        llvm_profdata_merge_opts += " %s" % (os.path.realpath(f))
+        
+    llvm_profdata_merged_file = "%s/merged.profdata" % cov_paths["profdata_dir"]
+    llvm_profdata_merge_opts += f" -o {llvm_profdata_merged_file}"
+    run_cmd(llvm_profdata_merge_opts, 
+            cov_paths["log_file"], 
+            cargs, 
+            LOG_ERRORS, 
+            False, 
+            ""
+            )
+    
+    llvm_show_opts = "llvm-cov show --format=html"
+    
     if cargs.enable_branch_coverage:
-        lcov_opts += " --rc lcov_branch_coverage=1"
-    if cargs.follow:
-        lcov_opts += " --follow"
-    if cargs.clang:
-        lcov_opts += " --gcov-tool afl-clang-cov.sh"
-
-    run_cmd(
-        cargs.lcov_path
-        + lcov_opts
-        + " --no-checksum --capture --directory "
-        + cargs.code_dir
-        + " --output-file "
-        + cov_paths["lcov_info"],
-        cov_paths["log_file"],
-        cargs,
-        LOG_ERRORS,
-        False,
-        "",
-    )
-
-    if cargs.disable_lcov_exclude_pattern:
-        out_lines = run_cmd(
-            cargs.lcov_path
-            + lcov_opts
-            + " --no-checksum -a "
-            + str(cov_paths["lcov_base"])
-            + " -a "
-            + str(cov_paths["lcov_info"])
-            + " --output-file "
-            + cov_paths["lcov_info_final"],
-            cov_paths["log_file"],
-            cargs,
-            WANT_OUTPUT,
-            False,
-            "",
-        )[1]
-    else:
-        tmp_file = NamedTemporaryFile(delete=False)
-        run_cmd(
-            cargs.lcov_path
-            + lcov_opts
-            + " --no-checksum -a "
-            + str(cov_paths["lcov_base"])
-            + " -a "
-            + str(cov_paths["lcov_info"])
-            + " --output-file "
-            + tmp_file.name,
-            cov_paths["log_file"],
-            cargs,
-            LOG_ERRORS,
-            False,
-            "",
-        )
-        out_lines = run_cmd(
-            cargs.lcov_path
-            + lcov_opts
-            + " --no-checksum -r "
-            + tmp_file.name
-            + " "
-            + cargs.lcov_exclude_pattern
-            + "  --output-file "
-            + cov_paths["lcov_info_final"],
-            cov_paths["log_file"],
-            cargs,
-            WANT_OUTPUT,
-            False,
-            "",
-        )[1]
-        if os.path.exists(tmp_file.name):
-            os.unlink(tmp_file.name)
-
-    log_coverage(out_lines, cov_paths["log_file"], cargs)
-
-    return
-
-
-def log_coverage(out_lines: List[bytes], log_file, cargs: argparse.Namespace):
-    for line in out_lines:
-        m = re.search(rb"^\s+(lines\.\..*:\s.*)", line)
-        if m and m.group(1):
-            logr(b"    " + m.group(1), log_file, cargs)
-        else:
-            m = re.search(rb"^\s+(functions\.\..*:\s.*)", line)
-            if m and m.group(1):
-                logr(b"    " + m.group(1), log_file, cargs)
-            else:
-                if cargs.enable_branch_coverage:
-                    m = re.search(rb"^\s+(branches\.\..*:\s.*)", line)
-                    if m and m.group(1):
-                        logr(
-                            b"    " + m.group(1),
-                            log_file,
-                            cargs,
-                        )
-    return
-
-
-def gen_web_cov_report(cov_paths, cargs):
-    genhtml_opts = ""
-
-    if cargs.enable_branch_coverage:
-        genhtml_opts += " --branch-coverage"
-
-    run_cmd(
-        cargs.genhtml_path
-        + genhtml_opts
-        + " --output-directory "
-        + cov_paths["web_dir"]
-        + " "
-        + cov_paths["lcov_info_final"],
-        cov_paths["log_file"],
-        cargs,
-        LOG_ERRORS,
-        False,
-        "",
-    )
-
-    logr(
-        b"[+] Final lcov web report: %s/%s"
-        % (cov_paths["web_dir"].encode(), b"index.html"),
-        cov_paths["log_file"],
-        cargs,
-    )
-
+        llvm_show_opts += " --show-branches=count --show-expansions"
+    
+    llvm_profdata_html_file = "%s/index.html" % cov_paths["top_dir"]
+    llvm_show_opts += f" -instr-profile={llvm_profdata_merged_file} -object {os.path.realpath(cargs.test_object)} >> {os.path.realpath(llvm_profdata_html_file)}"
+    
+    run_cmd(llvm_show_opts, 
+            cov_paths["log_file"], 
+            cargs, 
+            LOG_ERRORS, 
+            False, 
+            ""
+            )
+    
     return
 
 
@@ -877,7 +522,8 @@ def run_cmd(
         fh = open(os.devnull, "wb")
 
     if timeout:
-        cmd = "timeout -s KILL %s %s" % (timeout, cmd)
+        # timeout_pipe = "|" if cargs.llvm_config_path else ""
+        cmd = "timeout -s KILL %s | %s" % (timeout, cmd)
 
     if aflrun is True and len(fn) > 0:
         cmd = "cat " + fn + " | " + cmd
@@ -953,76 +599,20 @@ def init_tracking(cov_paths: CovPathsDictType, cargs: argparse.Namespace) -> boo
     cov_paths["dirs"] = {}
 
     cov_paths["top_dir"] = "%s/cov" % cargs.afl_fuzzing_dir
-    cov_paths["web_dir"] = "%s/web" % cov_paths["top_dir"]
-    cov_paths["lcov_dir"] = "%s/lcov" % cov_paths["top_dir"]
-    cov_paths["diff_dir"] = "%s/diff" % cov_paths["top_dir"]
+    cov_paths["profdata_dir"] = "%s/profdata" % cov_paths["top_dir"]
     cov_paths["log_file"] = "%s/afl-cov.log" % cov_paths["top_dir"]
 
     # global coverage results
-    cov_paths["id_delta_cov"] = "%s/id-delta-cov" % cov_paths["top_dir"]
     cov_paths["zero_cov"] = "%s/zero-cov" % cov_paths["top_dir"]
     cov_paths["pos_cov"] = "%s/pos-cov" % cov_paths["top_dir"]
-    cov_paths["diff"] = ""
     cov_paths["id_file"] = ""
     cov_paths["id_min"] = -1  # used in --cover-corpus mode
     cov_paths["id_max"] = -1  # used in --cover-corpus mode
 
-    # raw lcov files
-    cov_paths["lcov_base"] = "%s/trace.lcov_base" % cov_paths["lcov_dir"]
-    cov_paths["lcov_info"] = "%s/trace.lcov_info" % cov_paths["lcov_dir"]
-    cov_paths["lcov_info_final"] = "%s/trace.lcov_info_final" % cov_paths["lcov_dir"]
-
     if cargs.overwrite:
         mkdirs(cov_paths, cargs)
-    else:
-        if is_dir(cov_paths["top_dir"]):
-            if not cargs.func_search and not cargs.line_search:
-                print(
-                    "[*] Existing coverage dir %s found, use --overwrite to "
-                    "re-calculate coverage" % (cov_paths["top_dir"])
-                )
-                return False
-        else:
-            mkdirs(cov_paths, cargs)
 
     write_status("%s/afl-cov-status" % cov_paths["top_dir"])
-
-    if not cargs.disable_coverage_init and cargs.coverage_cmd:
-
-        lcov_opts = ""
-        if cargs.enable_branch_coverage:
-            lcov_opts += " --rc lcov_branch_coverage=1 "
-        if cargs.clang:
-            lcov_opts += " --gcov-tool afl-clang-cov.sh"
-
-        # reset code coverage counters - this is done only once as
-        # afl-cov is spinning up even if AFL is running in parallel mode
-        run_cmd(
-            cargs.lcov_path
-            + lcov_opts
-            + " --no-checksum --zerocounters --directory "
-            + cargs.code_dir,
-            cov_paths["log_file"],
-            cargs,
-            LOG_ERRORS,
-            False,
-            "",
-        )
-
-        run_cmd(
-            cargs.lcov_path
-            + lcov_opts
-            + " --no-checksum --capture --initial"
-            + " --directory "
-            + cargs.code_dir
-            + " --output-file "
-            + cov_paths["lcov_base"],
-            cov_paths["log_file"],
-            cargs,
-            LOG_ERRORS,
-            False,
-            "",
-        )
 
     return True
 
@@ -1033,32 +623,23 @@ def is_exe(fpath: str) -> bool:
     return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
 
 
-def is_bin_gcov_enabled(binary: str, cargs: argparse.Namespace) -> bool:
+def is_bin_llvm_prof_enabled(binary: str, cargs: argparse.Namespace) -> bool:
     rv = False
 
     # run readelf against the binary to see if it contains gcov support
     for line in run_cmd(
         "%s -a %s" % (cargs.readelf_path, binary), None, cargs, WANT_OUTPUT, False, ""
     )[1]:
-        if b" __gcov" in line:
-            if cargs.validate_args or cargs.gcov_check or cargs.gcov_check_bin:
+        if b" __llvm_prf_names" in line:
+            if cargs.validate_args or cargs.llvm_cov_check_bin:
                 print(
-                    "[+] Binary '%s' is compiled with code coverage support via gcc."
+                    "[+] Binary '%s' is compiled with code coverage support via clang."
                     % binary
                 )
             rv = True
             break
 
-        if b"__llvm_gcov" in line:
-            if cargs.validate_args or cargs.gcov_check or cargs.gcov_check_bin:
-                print(
-                    "[+] Binary '%s' is compiled with code coverage support via llvm."
-                    % binary
-                )
-            rv = True
-            break
-
-    if not rv and cargs.gcov_check_bin:
+    if not rv and cargs.llvm_cov_check_bin:
         print("[*] Binary '%s' is not compiled with code coverage support." % binary)
 
     return rv
@@ -1079,34 +660,23 @@ def which(prog: str) -> Optional[str]:
 
 
 def check_requirements(cargs: argparse.Namespace) -> bool:
-    lcov = which("lcov")
-    gcov = which("gcov")
-    genhtml = which("genhtml")
-
-    if lcov is None:
-        lcov = which(cargs.lcov_path)
-    if genhtml is None:
-        genhtml = which(cargs.genhtml_path)
-
-    if lcov is None or gcov is None:
+    llvm_cov = which("llvm-cov")
+    llvm_profdata = which("llvm-profdata")
+    
+    if llvm_cov is None or llvm_profdata is None:
         print("Required command not found :")
     else:
-        if genhtml is None and not cargs.disable_lcov_web:
-            print("Required command not found :")
-        else:
-            return True
+        return True
 
-    if lcov is None:
-        print("[*] lcov command does not exist :", cargs.lcov_path)
-    if genhtml is None and not cargs.disable_lcov_web:
-        print("[*] genhtml command does not exist :", cargs.genhtml_path)
-    if gcov is None:
-        print("[*] gcov command does not exist :", cargs.gcov_path)
+    if llvm_cov is None:
+        print("[*] llvm-cov command does not exist :", cargs.llvm_config_path)
+    if llvm_profdata is None:
+        print("[*] llvm_profdata command does not exist :", cargs.llvm_config_path)
 
     return False
 
 
-def is_gcov_enabled(cargs: argparse.Namespace) -> bool:
+def is_cov_enabled(cargs: argparse.Namespace) -> bool:
     if not is_exe(cargs.readelf_path):
         print("[*] Need a valid path to readelf, use --readelf-path")
         return False
@@ -1123,7 +693,7 @@ def is_gcov_enabled(cargs: argparse.Namespace) -> bool:
                 continue
             if which(part):
                 found_exec = True
-                if not cargs.disable_gcov_check and is_bin_gcov_enabled(part, cargs):
+                if not cargs.disable_llvm_cov_check and is_bin_llvm_prof_enabled(cargs.test_object, cargs):
                     found_code_cov_binary = True
                     break
 
@@ -1134,60 +704,29 @@ def is_gcov_enabled(cargs: argparse.Namespace) -> bool:
             )
             return False
 
-        if not cargs.disable_gcov_check and not found_code_cov_binary:
+        if not cargs.disable_llvm_cov_check and not found_code_cov_binary:
             print(
                 "[*] Could not find an executable binary with code "
-                "coverage support ('-fprofile-arcs -ftest-coverage') "
+                "coverage support ('-fprofile-instr-generate -fcoverage-mapping') "
                 "in --coverage-cmd '%s'" % cargs.coverage_cmd
             )
             return False
 
-    elif cargs.gcov_check_bin:
-        if not is_bin_gcov_enabled(cargs.gcov_check_bin, cargs):
+    elif cargs.llvm_cov_check_bin:
+        if not is_bin_llvm_prof_enabled(cargs.llvm_cov_check_bin, cargs):
             return False
-    elif cargs.gcov_check:
-        print(
-            "[*] Either --coverage-cmd or --gcov-check-bin required in --gcov-check mode"
-        )
-        return False
 
     return True
 
 
 def validate_cargs(cargs: argparse.Namespace) -> bool:
     if cargs.coverage_cmd:
-        if not is_gcov_enabled(cargs):
-            return False
-    else:
-        if not cargs.func_search and not cargs.line_search:
-            print("[*] Must set --coverage-cmd or --func-search/--line-search")
+        if not is_cov_enabled(cargs):
             return False
 
     if cargs.code_dir:
         if not is_dir(cargs.code_dir):
             print("[*] --code-dir path does not exist")
-            return False
-
-        # make sure code coverage support is compiled in
-        if not gcno_files_exist(cargs):
-            return False
-
-    else:
-        if not cargs.func_search and not cargs.line_search:
-            print(
-                "[*] Must set --code-dir unless using --func-search "
-                "against existing afl-cov directory"
-            )
-            return False
-
-    if cargs.func_search or cargs.line_search:
-        if not cargs.afl_fuzzing_dir:
-            print("[*] Must set --afl-fuzzing-dir")
-            return False
-        if cargs.func_search and "()" not in cargs.func_search:
-            cargs.func_search += "()"
-        if cargs.line_search and not cargs.src_file:
-            print("[*] Must set --src-file in --line-search mode")
             return False
 
     #if cargs.live and not cargs.ignore_core_pattern:
@@ -1200,28 +739,6 @@ def validate_cargs(cargs: argparse.Namespace) -> bool:
         )
         return False
 
-    if cargs.disable_lcov_web and cargs.lcov_web_all:
-        print("[*] --disable-lcov-web and --lcov-web-all are incompatible")
-        return False
-
-    return True
-
-
-def gcno_files_exist(cargs: argparse.Namespace) -> bool:
-    # make sure the code has been compiled with code coverage support,
-    # so *.gcno files should exist
-    found_code_coverage_support = False
-    for root, dirs, files in os.walk(cargs.code_dir):
-        for filename in files:
-            if filename[-5:] == ".gcno":
-                found_code_coverage_support = True
-    if not found_code_coverage_support:
-        print(
-            "[*] Could not find any *.gcno files in --code-dir "
-            "'%s', is code coverage ('-fprofile-arcs -ftest-coverage') "
-            "compiled in?" % cargs.code_dir
-        )
-        return False
     return True
 
 
@@ -1259,20 +776,9 @@ def mkdirs(cov_paths: CovPathsDictType, cargs: argparse.Namespace) -> None:
         create_cov_dirs = True
 
     if create_cov_dirs:
-        for k in ["top_dir", "web_dir", "lcov_dir", "diff_dir"]:
+        for k in ["top_dir", "profdata_dir"]:
             if not is_dir(cov_paths[k]):
                 os.mkdir(cov_paths[k])
-
-        # write coverage results in the following format
-        cfile = open(cov_paths["id_delta_cov"], "wb")
-        if cargs.cover_corpus or cargs.coverage_at_exit:
-            cfile.write(b"# id:[range]..., cycle, src_file, coverage_type, fcn/line\n")
-        else:
-            cfile.write(
-                b"# id:NNNNNN*_file, cycle, src_file, coverage_type, fcn/line\n"
-            )
-        cfile.close()
-
 
 def is_dir(dpath: str) -> bool:
     return os.path.exists(dpath) and os.path.isdir(dpath)
@@ -1355,6 +861,11 @@ def parse_cmdline() -> argparse.Namespace:
         help="Set command to exec (including args, and assumes code coverage support)",
     )
     p.add_argument(
+        "--test-object",
+        type=str,
+        help="Name of the target binary (need or llvm-cov show command)",
+    )
+    p.add_argument(
         "-d", "--afl-fuzzing-dir", type=str, help="top level AFL fuzzing directory"
     )
     p.add_argument(
@@ -1362,13 +873,6 @@ def parse_cmdline() -> argparse.Namespace:
         "--code-dir",
         type=str,
         help="Directory where the code lives (compiled with code coverage support)",
-    )
-    p.add_argument(
-        "-f",
-        "--follow",
-        action="store_true",
-        help="Follow links when searching .da files",
-        default=False,
     )
     p.add_argument(
         "-O",
@@ -1384,21 +888,9 @@ def parse_cmdline() -> argparse.Namespace:
         default=False,
     )
     p.add_argument(
-        "--disable-lcov-web",
-        action="store_true",
-        help="Disable generation of all lcov web code coverage reports",
-        default=False,
-    )
-    p.add_argument(
         "--disable-coverage-init",
         action="store_true",
         help="Disable initialization of code coverage counters at afl-cov startup",
-        default=False,
-    )
-    p.add_argument(
-        "--coverage-include-lines",
-        action="store_true",
-        help="Include lines in zero-coverage status files",
         default=False,
     )
     p.add_argument(
@@ -1414,21 +906,9 @@ def parse_cmdline() -> argparse.Namespace:
         default=False,
     )
     p.add_argument(
-        "--clang",
-        action="store_true",
-        help="If clang was used for coverage compilation instead of gcc",
-        default=False,
-    )
-    p.add_argument(
         "--cover-corpus",
         action="store_true",
         help="Measure coverage after running all available tests instead of individually per queue file",
-        default=False,
-    )
-    p.add_argument(
-        "--coverage-at-exit",
-        action="store_true",
-        help="Only calculate coverage just before afl-cov exit.",
         default=False,
     )
     p.add_argument(
@@ -1438,21 +918,15 @@ def parse_cmdline() -> argparse.Namespace:
         default=60,
     )
     p.add_argument(
-        "--gcov-check",
-        action="store_true",
-        help="Check to see if there is a binary in --coverage-cmd (or in --gcov-check-bin) has coverage support",
+        "--llvm-cov-check-bin",
+        type=str,
+        help="Test a specific binary for clang code coverage support",
         default=False,
     )
     p.add_argument(
-        "--gcov-check-bin",
+        "--disable-llvm-cov-check",
         type=str,
-        help="Test a specific binary for code coverage support",
-        default=False,
-    )
-    p.add_argument(
-        "--disable-gcov-check",
-        type=str,
-        help="Disable check for code coverage support",
+        help="Disable check for clang code coverage support",
         default=False,
     )
     p.add_argument(
@@ -1460,37 +934,6 @@ def parse_cmdline() -> argparse.Namespace:
         action="store_true",
         help="Background mode - if also in --live mode, will exit when the alf-fuzz process is finished",
         default=False,
-    )
-    p.add_argument(
-        "--lcov-web-all",
-        action="store_true",
-        help="Generate lcov web reports for all id:NNNNNN* files instead of just the last one",
-        default=False,
-    )
-    p.add_argument(
-        "--disable-lcov-exclude-pattern",
-        action="store_true",
-        help="Allow default /usr/include/* pattern to be included in lcov results",
-        default=False,
-    )
-    p.add_argument(
-        "--lcov-exclude-pattern",
-        type=str,
-        help="Set exclude pattern for lcov results",
-        default="/usr/include/\*",
-    )
-    p.add_argument(
-        "--func-search", type=str, help="Search for coverage of a specific function"
-    )
-    p.add_argument(
-        "--line-search",
-        type=str,
-        help="Search for coverage of a specific line number (requires --src-file)",
-    )
-    p.add_argument(
-        "--src-file",
-        type=str,
-        help="Restrict function or line search to a specific source file",
     )
     p.add_argument(
         "--afl-queue-id-limit",
@@ -1505,13 +948,10 @@ def parse_cmdline() -> argparse.Namespace:
         default=False,
     )
     p.add_argument(
-        "--lcov-path", type=str, help="Path to lcov command", default="/usr/bin/lcov"
-    )
-    p.add_argument(
-        "--genhtml-path",
+        "--llvm-config-path",
         type=str,
-        help="Path to genhtml command",
-        default="/usr/bin/genhtml",
+        help="Path to llvm-config command",
+        default="/usr/local/bin",
     )
     p.add_argument(
         "--readelf-path",
