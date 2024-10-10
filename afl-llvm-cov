@@ -443,7 +443,7 @@ def llvm_cov_gen_coverage(cov_paths: CovPathsDictType, cargs: argparse.Namespace
     llvm_show_opts = "llvm-cov show --format=html"
     
     if cargs.enable_branch_coverage:
-        llvm_show_opts += " --show-branches=count --show-expansions"
+        llvm_show_opts += " --show-branches=percent --show-expansions --show-line-counts"
     
     llvm_profdata_html_file = "%s/index.html" % cov_paths["top_dir"]
     llvm_show_opts += f" -instr-profile={llvm_profdata_merged_file} -object {os.path.realpath(cargs.test_object)} >> {os.path.realpath(llvm_profdata_html_file)}"
