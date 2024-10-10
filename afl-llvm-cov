@@ -424,7 +424,7 @@ def get_cycle_num(id_num: int, cargs: argparse.Namespace) -> int:
     return cycle_num
 
 def llvm_cov_gen_coverage(cov_paths: CovPathsDictType, cargs: argparse.Namespace):
-    llvm_profdata_merge_opts = "llvm-profdata merge"
+    llvm_profdata_merge_opts = "%sllvm-profdata merge" % (f"{cargs.llvm_config_path}/" if cargs.llvm_config_path else "")
     
     profdata_files = sorted(glob.glob(cov_paths["profdata_dir"] + "/*.profraw"))
     for f in profdata_files:
@@ -440,12 +440,12 @@ def llvm_cov_gen_coverage(cov_paths: CovPathsDictType, cargs: argparse.Namespace
             ""
             )
     
-    llvm_show_opts = "llvm-cov show --format=html"
+    llvm_show_opts = "%sllvm-cov show --format=html" % (f"{cargs.llvm_config_path}/" if cargs.llvm_config_path else "")
     
     if cargs.enable_branch_coverage:
         llvm_show_opts += " --show-branches=percent --show-expansions --show-line-counts"
     
-    llvm_profdata_html_file = "%s/index.html" % cov_paths["top_dir"]
+    # llvm_profdata_html_file = "%s/index.html" % cov_paths["top_dir"]
     llvm_show_opts += f" -instr-profile={llvm_profdata_merged_file} -object {os.path.realpath(cargs.test_object)} -o " + cov_paths["top_dir"]
     
     run_cmd(llvm_show_opts, 
